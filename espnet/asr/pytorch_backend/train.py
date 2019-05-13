@@ -6,13 +6,11 @@ import logging
 import os
 
 import torch
-import torch.distributed
-import torch.multiprocessing
+import horovod.torch as hvd
 import torch.utils.data
 import torch.utils.data.distributed
 
 from espnet.utils.deterministic_utils import set_deterministic_pytorch
-
 
 def load_batchset(json_path, args):
     from espnet.asr.asr_utils import make_batchset
@@ -87,24 +85,22 @@ def build_optimizer(args, model):
 def train(args):
     set_deterministic_pytorch(args)
 
-    # slurm available
-    import os
-    if args.world_size != 0 and "SLURM_NPROCS" in os.environ:
-        args.world_size = int(os.environ["SLURM_NPROCS"])
-        args.rank = int(os.environ["SLURM_PROCID"])
-        jobid = os.environ["SLURM_JOBID"]
-        args.dist_url = "file://{}.{}".format(os.path.realpath(args.outdir + "/" + args.dist_file), jobid)
-        logging.info("dist-url:{} at PROCID {} / {}".format(args.dist_url, args.rank, args.world_size))
     if args.world_size > 0:
         assert args.dist_url is not None, "you need to set --dist-url manually"
 
     # args.ngpu = torch.cuda.device_count()
     setattr(args, "distributed", args.world_size > 0)
-    if args.distributed:
+    if args.distributed and (not args.horovod):
         args.world_size = args.ngpu * args.world_size
         # Use torch.multiprocessing.spawn to launch distributed processes: the
         # main_worker process function
         torch.multiprocessing.spawn(main_worker, nprocs=args.ngpu, args=(args,))
+    if args.distributed and args.horovod:
+        # Initialize Horovod
+        hvd.init()
+        # Pin GPU to be used to process local rank (one GPU per process)
+        torch.cuda.set_device(hvd.local_rank())
+        main_worker(0, args)
     else:
         # Simply call main_worker function
         main_worker(0, args)
@@ -122,7 +118,7 @@ def main_worker(gpuid, args):
     from espnet.utils.deterministic_utils import set_deterministic_pytorch
     from espnet.utils.training.job import JobRunner
 
-    if args.distributed:
+    if args.distributed and (not args.horovod):
         logging.info('use GPU {} for training'.format(gpuid))
         # For multiprocessing distributed training, rank needs to be the
         # global rank among all the processes
@@ -137,7 +133,7 @@ def main_worker(gpuid, args):
     model = build_model(args)
     subsampling_factor = model.subsample[0]
 
-    if args.distributed:
+    if args.distributed and (not args.horovod):
         # For multiprocessing distributed, DistributedDataParallel constructor
         # should always set the single device scope, otherwise,
         # DistributedDataParallel will use all available devices.
@@ -149,6 +145,8 @@ def main_worker(gpuid, args):
         # DistributedDataParallel, we need to divide the batch size
         # ourselves based on the total number of GPUs we have
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[gpuid])
+    if args.distributed and args.horovod:
+        model.cuda()
     elif args.ngpu > 1:
         logging.info('batch size is automatically increased (%d -> %d)' % (
             args.batch_size, args.batch_size * args.ngpu))
@@ -160,7 +158,21 @@ def main_worker(gpuid, args):
     device = torch.device("cuda" if args.ngpu > 0 else "cpu")
     model = model.to(device)
 
+    # Gaofeng:
+    # if we use simple SGD, we need change lr as lr=args.lr * hvd.size()
     optimizer = build_optimizer(args, model)
+    if args.horovod:
+        # Horovod: broadcast parameters & optimizer state.
+        hvd.broadcast_parameters(model.state_dict(), root_rank=0)
+        hvd.broadcast_optimizer_state(optimizer, root_rank=0)
+
+        # Horovod: (optional) compression algorithm.
+        compression = hvd.Compression.fp16 if args.fp16_allreduce else hvd.Compression.none
+
+        # Horovod: wrap optimizer with DistributedOptimizer.
+        optimizer = hvd.DistributedOptimizer(optimizer,
+                                             named_parameters=model.named_parameters(),
+                                             compression=compression)
 
     # load datasets
     train_dataset = ASRDataset(load_batchset(args.train_json, args),
@@ -168,8 +180,10 @@ def main_worker(gpuid, args):
     valid_dataset = ASRDataset(load_batchset(args.valid_json, args),
                                subsampling_factor, args.preprocess_conf)
 
-    if args.distributed:
-        sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
+    if args.distributed and args.horovod:
+        sampler = torch.utils.data.distributed.DistributedSampler(train_dataset, 
+                                                                  num_replicas=hvd.size(), 
+                                                                  rank=hvd.rank())
     else:
         sampler = None
     # batch_size=1 because minibatch is already made in dataset
